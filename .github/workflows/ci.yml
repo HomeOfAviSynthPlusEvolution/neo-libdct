@@ -46,7 +46,6 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         fma: ['OFF', 'ON']
         platform:
@@ -110,7 +109,7 @@ jobs:
         with:
           python-version: '3.12'
           architecture: ${{ matrix.platform.arch }}
-      - name: Verify runner architecture
+      - name: Verify runner architecture and configure parallelism
         shell: python
         env:
           EXPECTED_ARCH: ${{ matrix.platform.arch }}
@@ -121,6 +120,11 @@ jobs:
           actual = platform.machine().lower()
           print(f"Runner architecture: {actual}")
           assert actual in expected[os.environ["EXPECTED_ARCH"]], "Unexpected runner architecture"
+          cpus = os.cpu_count() or 1
+          print(f"Build and test parallelism: {cpus}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"CMAKE_BUILD_PARALLEL_LEVEL={cpus}\n")
+              env.write(f"CTEST_PARALLEL_LEVEL={cpus}\n")
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
@@ -145,7 +149,7 @@ jobs:
           "-DCMAKE_C_FLAGS=$NEO_FLAGS" "-DCMAKE_CXX_FLAGS=$NEO_FLAGS"
           -DNEO_DCT_BUILD_TESTS=ON -DNEO_DCT_ALLOW_FMA=${{ matrix.fma }}
       - name: Build static library and tests
-        run: cmake --build build/ci --config ${{ matrix.platform.build_type }} --parallel 2
+        run: cmake --build build/ci --config ${{ matrix.platform.build_type }}
       # The numerical test forces every Highway target supported by this CPU,
       # and also tests the independent scalar backend. Do not force unsupported
       # instruction sets: verbose output records the targets actually executed.
@@ -155,4 +159,4 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: >-
           ctest --test-dir build/ci -C ${{ matrix.platform.build_type }}
-          --verbose --output-on-failure --no-tests=error --parallel 1
+          --verbose --output-on-failure --no-tests=error
