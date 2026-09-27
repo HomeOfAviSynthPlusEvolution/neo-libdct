@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, tidy and generated constants
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install LLVM tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-22 clang-format-22 clang-tidy-22
+      - name: Check generated constants
+        run: python tools/generate_constants.py --check
+      - name: Configure compilation database
+        run: >-
+          cmake -S . -B build/quality -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DNEO_DCT_BUILD_TESTS=ON
+      - name: Check formatting and static analysis
+        run: python .github/scripts/check_quality.py --build-dir build/quality
+
+  build:
+    name: ${{ matrix.platform.name }} / FMA ${{ matrix.fma }}
+    needs: quality
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        fma: ['OFF', 'ON']
+        platform:
+          - name: Windows x64 / clang-cl
+            os: windows-2025-vs2026
+            arch: x64
+            vs_arch: x64
+            build_type: Release
+          - name: Windows ARM64 / clang-cl
+            os: windows-11-vs2026-arm
+            arch: arm64
+            vs_arch: ARM64
+            build_type: Release
+          - name: Linux x64 / Clang 22
+            os: ubuntu-26.04
+            arch: x64
+            cc: clang-22
+            cxx: clang++-22
+            packages: ninja-build clang-22
+            build_type: Release
+          - name: Linux x64 / GCC
+            os: ubuntu-26.04
+            arch: x64
+            cc: gcc
+            cxx: g++
+            packages: ninja-build g++
+            build_type: Release
+          - name: Linux ARM64 / Clang 22
+            os: ubuntu-26.04-arm
+            arch: arm64
+            cc: clang-22
+            cxx: clang++-22
+            packages: ninja-build clang-22
+            build_type: Release
+          - name: Linux x64 / Clang 22 / ASan + UBSan
+            os: ubuntu-26.04
+            arch: x64
+            cc: clang-22
+            cxx: clang++-22
+            packages: ninja-build clang-22 libclang-rt-22-dev
+            build_type: RelWithDebInfo
+            flags: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+          - name: macOS x64 / Apple Clang
+            os: macos-15-intel
+            arch: x64
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
+            build_type: Release
+          - name: macOS ARM64 / Apple Clang
+            os: macos-15
+            arch: arm64
+            cc: /usr/bin/clang
+            cxx: /usr/bin/clang++
+            build_type: Release
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.platform.arch }}
+      - name: Verify runner architecture
+        shell: python
+        env:
+          EXPECTED_ARCH: ${{ matrix.platform.arch }}
+        run: |
+          import os
+          import platform
+          expected = {"x64": {"amd64", "x86_64"}, "arm64": {"arm64", "aarch64"}}
+          actual = platform.machine().lower()
+          print(f"Runner architecture: {actual}")
+          assert actual in expected[os.environ["EXPECTED_ARCH"]], "Unexpected runner architecture"
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.platform.packages }}
+      - name: Check generated constants
+        run: python tools/generate_constants.py --check
+      - name: Configure (Windows clang-cl)
+        if: runner.os == 'Windows'
+        run: >-
+          cmake -S . -B build/ci -G "Visual Studio 18 2026"
+          -A ${{ matrix.platform.vs_arch }} -T ClangCL
+          -DNEO_DCT_BUILD_TESTS=ON -DNEO_DCT_ALLOW_FMA=${{ matrix.fma }}
+      - name: Configure (Linux and macOS)
+        if: runner.os != 'Windows'
+        env:
+          CC: ${{ matrix.platform.cc }}
+          CXX: ${{ matrix.platform.cxx }}
+          NEO_FLAGS: ${{ matrix.platform.flags }}
+        run: >-
+          cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.platform.build_type }}
+          "-DCMAKE_C_FLAGS=$NEO_FLAGS" "-DCMAKE_CXX_FLAGS=$NEO_FLAGS"
+          -DNEO_DCT_BUILD_TESTS=ON -DNEO_DCT_ALLOW_FMA=${{ matrix.fma }}
+      - name: Build static library and tests
+        run: cmake --build build/ci --config ${{ matrix.platform.build_type }} --parallel 2
+      # The numerical test forces every Highway target supported by this CPU,
+      # and also tests the independent scalar backend. Do not force unsupported
+      # instruction sets: verbose output records the targets actually executed.
+      - name: Test numerical results, SIMD targets and C ABI
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >-
+          ctest --test-dir build/ci -C ${{ matrix.platform.build_type }}
+          --verbose --output-on-failure --no-tests=error --parallel 1
