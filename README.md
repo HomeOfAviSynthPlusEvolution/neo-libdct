@@ -20,4 +20,4 @@ Include the project with CMake's `add_subdirectory`, link against `neo::dct`, an
 
 ## License
 
-[GNU GPL v2](LICENSE)
+[GNU GPL v2 or later](LICENSE)
